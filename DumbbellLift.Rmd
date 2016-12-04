@@ -1,0 +1,272 @@
+---
+title: "Machine Learning Assignment Week 4"
+author: "Phil Telfer"
+date: "28 November 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r LoadLibraries, include=FALSE, results="hide", warning=FALSE, message=FALSE}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(MASS)
+library(kernlab)
+library(randomForest)
+library(gbm)
+library(class)
+```
+
+## Executive Summary
+
+This report used wearable fitness data from a website to predict whether a particular activity, in this case Unilateral Biceps Dumbbell Curls, was being conducted correctly.
+
+Five models were developed and tested for estimated test error accuracy using a 5 fold cross validation technique:
+
+- Linear Determinant Analysis
+- Boosting (gbm)
+- Support Vector Machines 
+- 'K' Nearest Neighbours
+- Random Forests
+
+A final validation test was conducted using validation data between the Nearest Neighbour and Random Forest models, with the Random Forest model being the final selected model with an estimated test error of 93%.
+
+Finally, the Randon Forest model was used to predict against the assignment test data.
+
+The .rmd file (DumbbellLift.Rmd) for this output is available at <https://github.com/PhilTel/datasciencecoursera/DumbbellLift.rmd>
+
+## Introduction
+
+Fitness tracking devices provide opportunities for fitness enthusiasts to track their daily activities and sleep patterns. This report uses activity data from a number of tracking devices extracted while the wearer performs a dumbbell lift, and uses that data to predict how well the dumbbell lift is performed.
+
+The data source for this report is <http://groupware.les.inf.puc-rio.br/har> (see the section on the Weight Lifting Exercise Dataset).
+
+## Data and Feature Selection
+
+### The Training and Test datasets
+
+The data was sourced from a trial of six young health participants who performed one set of 10 repetitions of a Unilateral Dumbbell Biceps Curl in five different fashions:
+
+- Class A - exactly according to the specification.
+- Class B - throwing the elbows to the front.
+- Class C - lifting the dumbbell only halfway.
+- Class D - lowering the dumbbell only halfway.
+- Class E - throwing the hips to the front.
+
+The trial generated dataset contains 160 variables including identification data on the trial participant, accelerometer, gyro and magnetic sensor data from four sensors placed on the participants belt, arm, forearm and dumbell, calculated dynamic characteristic variables (ie roll, kurtosis, skewness, yaw etc), and a classification variable on the goodness of the movement (Class A through E).
+
+Datasets pre-delineated into Training and Testing data are available from the Groupware website and accessed via the following http address:
+
+- Training: <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>
+- Test: <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv> 
+
+```{r ReadData}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "training.csv", method = "curl")
+training <- read.csv("training.csv")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "test.csv", method = "curl")
+test <- read.csv("test.csv")
+```
+
+### Feature Selection
+
+The training data is captured as a time based series, however the provided test dataset requires prediction of the 'classe' variable given only a randomly selected observation point at a single timepoint. Therefore, the predictive model will not be based on timeseries analysis. An initial exploratory view of the timestamp variables indicate correlation to the user (user_name) variable but limited correlation to the 'classe' classification outcome, and hence time and date variables were not selected as features, but user name was.
+
+The dataset contains many measured and calculated variables, however all derived data points will have been calculated from the 36 core sensor data points, which are captured in the form [Sensor Type]-[Sensor Location]-[Sensor Direction] across the combination of:  
+
+- Sensor Type (gyros, accelerometer, magnet),
+- Location (belt, arm, forearm, dumbbell), and
+- Sensor Direction (x, y, z).
+
+For example "gyros_belt_y". Along with the 'user_name' variable, these 36 variables have been selected to form the initial features used to derive the model to predict the classification ('classe') variable 
+
+### Data Preparation
+
+The training and test datasets are reduced to contain only the required feature variables, user_name and (for training) classe outcomes.
+
+```{r DataPreparation}
+tr <- dplyr::select(training, user_name)
+te <- dplyr::select(test, user_name)
+for (t in c("gyros", "accel", "magnet")){
+        for (l in c("belt", "arm", "forearm", "dumbbell")){
+                for (d in c("x", "y", "z")){
+                        name <- paste(t, l, d, sep="_")
+                        temp_tr <- as.data.frame(training[,name])
+                        temp_te <- as.data.frame(test[,name])
+                        names(temp_tr) <- name
+                        names(temp_te) <- name
+                        tr <- cbind(tr, temp_tr)
+                        te <- cbind(te, temp_te)
+                }
+        }
+}
+temp_tr <- dplyr::select(training, classe)
+tr <- cbind(tr, temp_tr)
+```
+
+For Boosting, 'K' nearest neighbours, Support Vector Machine, and Random Forest calculations my available computing power could not return a result in a reasonable time, and hence I used only 50% (and only 20% for Random Forest) of the training data to develop the models. While the reduction in observations to be used is likely to reduce the potential model accuracy, the large size of the dataset, approximately 10,000 observations at 50% and 4,000 observations at 20% is still sufficient to provide reasonable accuracy.
+
+```{r ReduceTrainingSet}
+#Randomise tr and take 50% and 20% training sets
+set.seed(4)
+tr <- tr[sample(nrow(tr)),]
+tr50 <- tr[(1:(nrow(tr)%/%2)),]
+tr20 <- tr[(1:(nrow(tr)%/%5)),]
+```
+
+## Model Selection and Cross Validation
+
+### Model Selection
+
+The aim of this report is to develop a model for 'prediction' rather than 'interpretability', and hence machine learning algorithms more closely aligned with flexibility than interpretability will be considered. The variable to be predicted, 'classe', is also a categorical variable, and hence modelling techniques associated with 'classification' problems will also be favoured.
+
+Model types to be investigated include:
+
+- Linear Discriminant Analysis
+- Boosting (gbm)
+- Support Vector Machine
+- 'k' Nearest Neighbours
+- Random Forests
+
+### Cross Validation
+
+In order to select the model with best prediction accuracy, Cross Validation will be used to generate an estimated test error. 'k fold' cross validation with k = 5 will be used to achieve a reasonable trade-off betwen bias and variance error, while minimising the computation requirements for the calculations. (see G James, D Witten, T Hastie, R Tibshirani; 'An Introduction to Statistical Learning', Springer, 6th ed, 2015).
+
+```{r SetCrossValidationControl}
+train_control <- trainControl(method="cv", number=5)
+```
+
+## Model Development and Accuracy Estimation 
+
+### Linear Discriminant Analysis
+
+```{r LDA}
+modLDA <- train(classe ~ ., data = tr, trControl = train_control, method = "lda")
+print(modLDA)
+
+accLDA <- modLDA$results[2]
+```
+
+The LDA model provides an estimated test accuracy of `r accLDA` percent. 
+
+### Boosting
+
+```{r Boosting, results="hide"}
+modGBM <- train(classe ~ ., data = tr50, trControl = train_control, method = "gbm")
+```
+```{r BoostingPrint}
+print(modGBM)
+accGBM <- max(modGBM$results$Accuracy)
+```
+
+The Boosting model provides an estimated test accuracy of `r accGBM` percent. 
+
+### 'k' Nearest Neighbours
+
+```{r KNN}
+knnGrid <- expand.grid(.k=1)
+modKNN <- train(classe ~ ., data = tr50, trControl = train_control, tuneGrid = knnGrid, method = "knn")
+print(modKNN)
+accKNN <- modKNN$results[2]
+```
+
+The results show a potential accuracy of `r accKNN` percent, however KNN can often be improved through normalisation of the variables. This is trialled to observe the results: 
+
+```{r KNN_Normalise}
+#Normalise the parametric data
+trKNN <- tr50
+trKNN[,2:37] <- scale(tr50[,2:37])
+
+modKNN1 <- train(classe ~ ., data = trKNN, trControl = train_control, tuneGrid = knnGrid, method = "knn")
+print(modKNN1)
+accKNN1 <- modKNN1$results[2]
+```
+
+Parametric data variable normalisation appears to have improved the estimated prediction accuracy from `r accKNN` to `r accKNN1` percent.
+
+The value of 'k' can also be tuned to provide the model with more flexibility or a smoother prediction curve. The value of k = 3 and 11 are also trialled with the normalised training dataset to see if there is an optimal 'k' value.
+
+```{r KNN_kValue}
+knnGrid <- expand.grid(.k=3)
+modKNN3 <- train(classe ~ ., data = trKNN, trControl = train_control, tuneGrid = knnGrid, method = "knn")
+print(modKNN3)
+knnGrid <- expand.grid(.k=11)
+modKNN11 <- train(classe ~ ., data = trKNN, trControl = train_control, tuneGrid = knnGrid, method = "knn")
+print(modKNN11)
+```
+
+The results indicate that as k increases, the estimated 5 fold cross validation test accuracy decreases, which suggests that an accurate model requirs a high degree of freedom. In this case when k = 1, and with using the normalised data, provides the best estimated test accuracy of `r accKNN1`.
+
+### Support Vector Machine
+
+```{r SVM_Radial}
+modSVMR <- train(classe ~ ., data = tr50, trControl = train_control, method = "svmRadial")
+print(modSVMR)
+accSVMR <- max(modSVMR$results$Accuracy)
+```
+
+```{r SVM_Linear}
+modSVML <- train(classe ~ ., data = tr50, trControl = train_control, method = "svmLinear")
+print(modSVML)
+accSVML <- max(modSVML$results$Accuracy)
+```
+
+The Support VEctor Machine model provides an estimated test accuracy of `r accSVMR` percent for the SVM radial method, and `r accSVML` for the SVM linear method.
+
+### Random Forest
+
+```{r RF}
+modRF <- train(classe ~ ., data = tr20, trControl = train_control, method = "rf")
+print(modRF)
+accRF <- modRF$results[1,2]
+```
+
+The Random Forest model provides an estimated test accuracy of `r accRF` percent.
+
+## Final Validation and Estimated Accuracy
+
+The K Nearest Neighbours and Random Forest models have produced the best predicted accuracy, however as those models were developed using a reduced dataset, a final validation, against the unused 50% of the training dataset, will be used to determine the most favoured model.
+
+```{r finalValidation}
+val <- tr[((nrow(tr)%/%2) + 1):(nrow(tr)), ]
+#KNN
+predKNN <- predict(modKNN1, newdata=val)
+cmKNN <- confusionMatrix(predKNN, val$classe)
+#RF
+predRF <- predict(modRF, newdata=val)
+cmRF <- confusionMatrix(predRF, val$classe)
+
+accKNNOverall <- cmKNN$overall[1]
+accRFOverall <- cmRF$overall[1]
+```
+
+- Estimated KNN model accuracy is: `r accKNNOverall`.
+- Estimated RF model accuracy is: `r accRFOverall`.
+
+## Prediction
+
+The selected model, modRF, is used to predict answers to the testset (te):
+
+```{r finalPrediction}
+predTE <- predict(modRF, newdata=te)
+print(predTE)
+```
+
+## Summary
+
+This report used wearable fitness data from a website to predict whether a particular activity, in this case Unilateral Biceps Dumbbell Curls, was being conducted correctly.
+
+Five models were developed and tested for estimated test error accuracy using a 5 fold cross validation technique. The training dataset used, with the exception of the LDA model, was 50% (or 20% for Random Forest) of the overall training data due to available computing power. Percent estimated model test accuracies are as follows:
+
+- Linear Determinant Analysis: `r accLDA`.
+- Boosting (gbm): `r accGBM`.
+- Support Vector Machines: `r accSVMR` for radial and `r accSVML` for linear method. 
+- 'K' Nearest Neighbours: `r accKNN1` with k = 1 and normalised data.
+- Random Forests: `r accRF`
+
+A final validation test was conducted using previously unused training data between the Nearest Neighbour and Random Forest models, with the Random Forest model being the selected model with an estimated test error of `r accRFOverall`.
+
+Finally, the Random Forest model was used to predict against the assignment test set (te). 
